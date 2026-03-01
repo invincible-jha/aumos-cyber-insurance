@@ -309,3 +309,107 @@ class CarrierListResponse(BaseModel):
 
     items: list[CarrierResponse]
     total: int
+
+
+# ---------------------------------------------------------------------------
+# GAP-521: Third-party vendor assessment schemas
+# ---------------------------------------------------------------------------
+
+
+class ThirdPartyAssessmentRequest(BaseModel):
+    """Request body for POST /api/v1/insurance/assessments/{id}/third-party-scan."""
+
+    vendor_name: str = Field(
+        description="Name of the third-party vendor to assess",
+        examples=["Acme Cloud Services"],
+    )
+    vendor_category: str | None = Field(
+        default=None,
+        description="Vendor risk category: cloud | saas | critical | high | medium | low",
+        examples=["cloud"],
+    )
+    controls_reviewed: list[str] = Field(
+        default_factory=list,
+        description="Control domain IDs to include in the vendor review",
+        examples=[["mfa", "endpoint_detection", "backup_recovery"]],
+    )
+    assessment_metadata: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Optional additional metadata for this vendor assessment",
+    )
+
+
+class ThirdPartyAssessmentResponse(BaseModel):
+    """Response model for third-party vendor risk assessments."""
+
+    assessment_id: uuid.UUID
+    vendor_name: str
+    vendor_category: str | None
+    risk_score: float
+    risk_tier: str
+    findings: list[dict[str, Any]]
+    controls_reviewed: list[str]
+    assessment_status: str
+
+    model_config = {"from_attributes": True}
+
+
+# ---------------------------------------------------------------------------
+# GAP-522: Portfolio optimization schemas
+# ---------------------------------------------------------------------------
+
+
+class PortfolioOptimizeRequest(BaseModel):
+    """Request body for POST /api/v1/insurance/premium/portfolio."""
+
+    assessment_id: uuid.UUID = Field(
+        description="Completed PostureAssessment UUID to optimize portfolio for",
+    )
+    carrier_ids: list[str] = Field(
+        description="List of carrier IDs to include in portfolio optimization",
+        examples=[["hiscox", "coalition", "chubb", "travelers"]],
+    )
+    current_premiums: dict[str, float] | None = Field(
+        default=None,
+        description="Current annual premiums per carrier {carrier_id: usd_amount}",
+        examples=[{"hiscox": 45000.0, "coalition": 38000.0}],
+    )
+    coverage_limits: dict[str, float] | None = Field(
+        default=None,
+        description="Current coverage limits per carrier {carrier_id: usd_amount}",
+        examples=[{"hiscox": 5000000.0, "coalition": 3000000.0}],
+    )
+
+
+class PortfolioRecommendationResponse(BaseModel):
+    """Response model for multi-carrier portfolio optimization."""
+
+    assessment_id: str
+    tenant_id: str
+    carrier_count: int
+    carriers: list[dict[str, Any]]
+    total_current_premium_usd: float
+    total_optimized_premium_usd: float
+    total_savings_usd: float
+    recommended_carrier: str | None
+    posture_score: float | None
+    optimization_sample_size: int
+
+    model_config = {"from_attributes": True}
+
+
+# ---------------------------------------------------------------------------
+# GAP-524: Posture trends schemas
+# ---------------------------------------------------------------------------
+
+
+class PostureTrendsResponse(BaseModel):
+    """Response model for posture score trend analysis."""
+
+    platform_id: str
+    tenant_id: uuid.UUID
+    days_requested: int
+    snapshot_count: int
+    snapshots: list[dict[str, Any]]
+
+    model_config = {"from_attributes": True}

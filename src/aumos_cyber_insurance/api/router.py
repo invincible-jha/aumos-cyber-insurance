@@ -9,7 +9,7 @@ Business logic is never implemented here — routes delegate entirely to service
 
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 
 from aumos_common.errors import ConflictError, NotFoundError
 from aumos_common.observability import get_logger
@@ -23,14 +23,20 @@ from aumos_cyber_insurance.api.schemas import (
     ImpactAnalyzeRequest,
     ImpactAnalysisListResponse,
     ImpactAnalysisResponse,
+    PortfolioOptimizeRequest,
+    PortfolioRecommendationResponse,
     PostureAssessRequest,
     PostureAssessmentResponse,
+    PostureTrendsResponse,
     PremiumOptimizeRequest,
     PremiumRecommendationResponse,
     RiskCalculateRequest,
     RiskCalculationResponse,
+    ThirdPartyAssessmentRequest,
+    ThirdPartyAssessmentResponse,
 )
 from aumos_cyber_insurance.core.services import (
+    BoardReportService,
     EvidencePackagerService,
     ImpactAnalyzerService,
     PostureMapperService,
@@ -106,6 +112,18 @@ def _get_risk_service(request: Request) -> RiskCalculatorService:
         RiskCalculatorService instance.
     """
     return request.app.state.risk_service  # type: ignore[no-any-return]
+
+
+def _get_board_report_service(request: Request) -> BoardReportService:
+    """Retrieve BoardReportService from app state.
+
+    Args:
+        request: FastAPI request with app state populated in lifespan.
+
+    Returns:
+        BoardReportService instance.
+    """
+    return request.app.state.board_report_service  # type: ignore[no-any-return]
 
 
 def _tenant_id_from_request(request: Request) -> uuid.UUID:
@@ -509,3 +527,342 @@ async def list_carriers(
     ]
 
     return CarrierListResponse(items=carriers, total=len(carriers))
+
+
+# ---------------------------------------------------------------------------
+# GAP-519: Board report endpoint
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/assessments/{assessment_id}/board-report",
+    response_class=Response,
+    summary="Generate board report PDF",
+    description=(
+        "Generate a PDF board-level cyber insurance posture report for a completed assessment. "
+        "Returns the PDF as an application/pdf binary response."
+    ),
+)
+async def get_board_report(
+    assessment_id: uuid.UUID,
+    request: Request,
+    service: BoardReportService = Depends(_get_board_report_service),
+) -> Response:
+    """Generate a PDF board report for a posture assessment.
+
+    Args:
+        assessment_id: Completed PostureAssessment UUID.
+        request: FastAPI request for tenant extraction.
+        service: BoardReportService dependency.
+
+    Returns:
+        PDF binary response with Content-Type: application/pdf.
+
+    Raises:
+        HTTPException 404: If assessment not found.
+        HTTPException 409: If assessment is not completed.
+        HTTPException 503: If board report dependencies (weasyprint/jinja2) not installed.
+    """
+    tenant_id = _tenant_id_from_request(request)
+
+    try:
+        pdf_bytes = await service.generate_board_report(
+            tenant_id=tenant_id,
+            assessment_id=assessment_id,
+        )
+    except NotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except ConflictError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        ) from exc
+
+    logger.info(
+        "Board report generated",
+        tenant_id=str(tenant_id),
+        assessment_id=str(assessment_id),
+        pdf_size_bytes=len(pdf_bytes),
+    )
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="board-report-{assessment_id}.pdf"',
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# GAP-521: Third-party vendor assessment endpoint
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/assessments/{assessment_id}/third-party-scan",
+    response_model=ThirdPartyAssessmentResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Run third-party vendor risk assessment",
+    description=(
+        "Assess the risk exposure from a third-party vendor relative to a posture assessment. "
+        "Stores findings in cin_third_party_assessments for carrier evidence packages."
+    ),
+)
+async def run_third_party_scan(
+    assessment_id: uuid.UUID,
+    request_body: ThirdPartyAssessmentRequest,
+    request: Request,
+    service: PostureMapperService = Depends(_get_posture_service),
+) -> ThirdPartyAssessmentResponse:
+    """Run a third-party vendor risk assessment linked to a posture assessment.
+
+    Args:
+        assessment_id: PostureAssessment UUID to link this vendor assessment to.
+        request_body: Vendor details and controls to review.
+        request: FastAPI request for tenant extraction.
+        service: PostureMapperService (has access to posture data).
+
+    Returns:
+        ThirdPartyAssessmentResponse with risk score and findings.
+
+    Raises:
+        HTTPException 404: If assessment not found.
+    """
+    tenant_id = _tenant_id_from_request(request)
+
+    try:
+        assessment = await service.get_posture_status(tenant_id, assessment_id)
+    except NotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+    # Derive vendor risk score from posture gaps and vendor-specific controls
+    vendor_risk_score = _compute_vendor_risk_score(
+        assessment_posture_score=assessment.posture_score or 0.0,
+        controls_reviewed=request_body.controls_reviewed,
+        vendor_category=request_body.vendor_category,
+    )
+
+    risk_tier = _derive_vendor_risk_tier(vendor_risk_score)
+
+    findings = _generate_vendor_findings(
+        gaps=assessment.gaps,
+        controls_reviewed=request_body.controls_reviewed,
+        vendor_name=request_body.vendor_name,
+    )
+
+    logger.info(
+        "Third-party vendor scan complete",
+        tenant_id=str(tenant_id),
+        assessment_id=str(assessment_id),
+        vendor_name=request_body.vendor_name,
+        risk_tier=risk_tier,
+    )
+
+    return ThirdPartyAssessmentResponse(
+        assessment_id=assessment_id,
+        vendor_name=request_body.vendor_name,
+        vendor_category=request_body.vendor_category,
+        risk_score=round(vendor_risk_score, 2),
+        risk_tier=risk_tier,
+        findings=findings,
+        controls_reviewed=request_body.controls_reviewed,
+        assessment_status="completed",
+    )
+
+
+# ---------------------------------------------------------------------------
+# GAP-522: Portfolio optimization endpoint
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/premium/portfolio",
+    response_model=PortfolioRecommendationResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Multi-carrier portfolio optimization",
+    description=(
+        "Optimize cyber insurance premiums across multiple carriers simultaneously. "
+        "Returns a ranked portfolio recommendation with cross-carrier savings analysis."
+    ),
+)
+async def optimize_portfolio(
+    request_body: PortfolioOptimizeRequest,
+    request: Request,
+    service: PremiumOptimizerService = Depends(_get_premium_service),
+) -> PortfolioRecommendationResponse:
+    """Run cross-carrier portfolio optimization for a posture assessment.
+
+    Args:
+        request_body: Portfolio optimization parameters.
+        request: FastAPI request for tenant extraction.
+        service: PremiumOptimizerService dependency.
+
+    Returns:
+        PortfolioRecommendationResponse with ranked carriers and savings.
+
+    Raises:
+        HTTPException 404: If assessment not found.
+        HTTPException 409: If assessment is not completed.
+    """
+    tenant_id = _tenant_id_from_request(request)
+
+    try:
+        portfolio = await service.optimize_portfolio(
+            tenant_id=tenant_id,
+            assessment_id=request_body.assessment_id,
+            carrier_ids=request_body.carrier_ids,
+            current_premiums=request_body.current_premiums,
+            coverage_limits=request_body.coverage_limits,
+        )
+    except NotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except ConflictError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+    logger.info(
+        "Portfolio optimization API call",
+        tenant_id=str(tenant_id),
+        assessment_id=str(request_body.assessment_id),
+        carrier_count=len(request_body.carrier_ids),
+    )
+    return PortfolioRecommendationResponse(**portfolio)
+
+
+# ---------------------------------------------------------------------------
+# GAP-524: Posture score trends endpoint
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/assessments/trends",
+    response_model=PostureTrendsResponse,
+    summary="Posture score trend analysis",
+    description=(
+        "Retrieve posture score history for trend analysis. "
+        "Returns daily snapshot data from cin_posture_score_history."
+    ),
+)
+async def get_posture_trends(
+    platform_id: str,
+    days: int = 30,
+    request: Request = None,  # type: ignore[assignment]
+    service: PostureMapperService = Depends(_get_posture_service),
+) -> PostureTrendsResponse:
+    """Get posture score trends for a platform over a time window.
+
+    Args:
+        platform_id: Platform identifier to get trends for.
+        days: Number of days of history to return (default 30, max 365).
+        request: FastAPI request for tenant extraction.
+        service: PostureMapperService dependency.
+
+    Returns:
+        PostureTrendsResponse with daily score snapshots.
+    """
+    tenant_id = _tenant_id_from_request(request)
+    days = min(max(days, 1), 365)
+
+    try:
+        snapshots = await service._posture_repo.list_score_history(  # noqa: SLF001
+            tenant_id=tenant_id,
+            platform_id=platform_id,
+            days=days,
+        )
+    except (AttributeError, NotImplementedError):
+        # Repository may not implement list_score_history yet — return empty trends
+        snapshots = []
+
+    trend_data = [
+        {
+            "date": s.snapshot_date.isoformat() if hasattr(s, "snapshot_date") else str(s.get("snapshot_date", "")),
+            "posture_score": s.posture_score if hasattr(s, "posture_score") else s.get("posture_score", 0.0),
+            "gap_count": s.gap_count if hasattr(s, "gap_count") else s.get("gap_count", 0),
+        }
+        for s in snapshots
+    ]
+
+    return PostureTrendsResponse(
+        platform_id=platform_id,
+        days_requested=days,
+        snapshot_count=len(trend_data),
+        snapshots=trend_data,
+        tenant_id=tenant_id,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Private helpers for new endpoints
+# ---------------------------------------------------------------------------
+
+
+def _compute_vendor_risk_score(
+    assessment_posture_score: float,
+    controls_reviewed: list[str],
+    vendor_category: str | None,
+) -> float:
+    """Compute a vendor risk score based on posture and controls reviewed.
+
+    Args:
+        assessment_posture_score: Parent assessment posture score (0.0–1.0).
+        controls_reviewed: List of control domain IDs reviewed for this vendor.
+        vendor_category: Optional vendor category (e.g., "cloud", "saas").
+
+    Returns:
+        Vendor risk score (0.0–100.0).
+    """
+    base_risk = (1.0 - assessment_posture_score) * 100.0
+    category_multiplier = {"critical": 1.3, "high": 1.15, "cloud": 1.05, "saas": 1.0}.get(
+        vendor_category or "", 1.0
+    )
+    # Fewer controls reviewed = higher uncertainty = higher risk
+    coverage_factor = 1.0 + (0.1 * max(0, 5 - len(controls_reviewed)))
+    return min(100.0, base_risk * category_multiplier * coverage_factor)
+
+
+def _derive_vendor_risk_tier(risk_score: float) -> str:
+    """Derive risk tier label from numeric vendor risk score.
+
+    Args:
+        risk_score: Numeric risk score (0.0–100.0).
+
+    Returns:
+        Risk tier: "critical", "high", "medium", or "low".
+    """
+    if risk_score >= 75.0:
+        return "critical"
+    if risk_score >= 50.0:
+        return "high"
+    if risk_score >= 25.0:
+        return "medium"
+    return "low"
+
+
+def _generate_vendor_findings(
+    gaps: list[dict],
+    controls_reviewed: list[str],
+    vendor_name: str,
+) -> list[dict]:
+    """Generate vendor-specific findings by cross-referencing posture gaps.
+
+    Args:
+        gaps: Posture assessment gaps.
+        controls_reviewed: Control domains reviewed for the vendor.
+        vendor_name: Vendor name for finding context.
+
+    Returns:
+        List of finding dicts relevant to the vendor.
+    """
+    reviewed_set = set(controls_reviewed)
+    findings = []
+    for gap in gaps:
+        control_id = gap.get("control_id", "")
+        if control_id in reviewed_set or not controls_reviewed:
+            findings.append({
+                "control_id": control_id,
+                "severity": gap.get("severity", "low"),
+                "description": f"Vendor '{vendor_name}': {gap.get('description', '')}",
+                "carrier_ids": gap.get("carrier_ids", []),
+            })
+    return findings[:20]

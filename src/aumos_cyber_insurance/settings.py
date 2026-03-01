@@ -74,6 +74,64 @@ class Settings(AumOSSettings):
     )
 
     # ---------------------------------------------------------------------------
+    # Carrier adapter selection (GAP-517)
+    # ---------------------------------------------------------------------------
+    carrier_adapter: str = Field(
+        default="stub",
+        description=(
+            "Carrier adapter implementation: 'stub' (dev/test) or 'database' (production). "
+            "Set to 'database' to use cin_carrier_requirements table via DatabaseCarrierAdapter."
+        ),
+    )
+
+    # ---------------------------------------------------------------------------
+    # Continuous monitoring (GAP-518)
+    # ---------------------------------------------------------------------------
+    continuous_monitoring_enabled: bool = Field(
+        default=False,
+        description="Enable background continuous posture monitoring job via APScheduler",
+    )
+    drift_alert_threshold: float = Field(
+        default=0.10,
+        description=(
+            "Fractional posture score drop that triggers a drift_detected event. "
+            "E.g. 0.10 means a 10-point drop on a 0-100 scale triggers an alert."
+        ),
+    )
+    monitoring_schedule_hour: int = Field(
+        default=2,
+        description="UTC hour (0-23) at which the daily posture monitoring job runs",
+    )
+
+    # ---------------------------------------------------------------------------
+    # Board reporting (GAP-519)
+    # ---------------------------------------------------------------------------
+    board_report_template_dir: str = Field(
+        default="templates/board_reports",
+        description="Path (relative to project root or absolute) to Jinja2 board report templates",
+    )
+    board_report_logo_url: str = Field(
+        default="",
+        description="URL or file path to company logo embedded in board report PDF",
+    )
+
+    # ---------------------------------------------------------------------------
+    # Regulatory monitoring (GAP-523)
+    # ---------------------------------------------------------------------------
+    regulatory_monitoring_enabled: bool = Field(
+        default=False,
+        description="Enable background carrier regulatory change monitoring via RSS/SEC feeds",
+    )
+    regulatory_feed_urls: list[str] = Field(
+        default_factory=list,
+        description="RSS/Atom feed URLs to monitor for carrier regulatory changes",
+    )
+    regulatory_check_interval_hours: int = Field(
+        default=6,
+        description="Hours between regulatory feed polling cycles",
+    )
+
+    # ---------------------------------------------------------------------------
     # HTTP client settings
     # ---------------------------------------------------------------------------
     http_timeout: float = Field(

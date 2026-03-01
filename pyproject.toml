@@ -29,6 +29,13 @@ dependencies = [
     "asyncpg>=0.29.0",
     "pydantic-settings>=2.2.0",
     "alembic>=1.13.0",
+    # GAP-518/523: Background scheduling for continuous and regulatory monitoring
+    "apscheduler>=3.10.4",
+    # GAP-519: PDF board report generation
+    "weasyprint>=62.0",
+    "jinja2>=3.1.0",
+    # GAP-523: RSS feed parsing for regulatory monitoring
+    "feedparser>=6.0.0",
 ]
 
 [project.optional-dependencies]
